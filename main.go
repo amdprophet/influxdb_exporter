@@ -14,54 +14,22 @@
 package main
 
 import (
-	"compress/gzip"
-	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
-	"net"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	clientModel "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/promlog"
-	"github.com/prometheus/common/promlog/flag"
-	"github.com/prometheus/common/version"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/influxdata/influxdb/models"
-	"gopkg.in/alecthomas/kingpin.v2"
-)
-
-const (
-	MAX_UDP_PAYLOAD = 64 * 1024
-)
-
-var (
-	listenAddress       = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface.").Default(":9122").String()
-	metricsPath         = kingpin.Flag("web.telemetry-path", "Path under which to expose Prometheus metrics.").Default("/metrics").String()
-	exporterMetricsPath = kingpin.Flag("web.exporter-telemetry-path", "Path under which to expose exporter metrics.").Default("/metrics/exporter").String()
-	sampleExpiry        = kingpin.Flag("influxdb.sample-expiry", "How long a sample is valid for.").Default("5m").Duration()
-	bindAddress         = kingpin.Flag("udp.bind-address", "Address on which to listen for udp packets.").Default(":9122").String()
-	exportTimestamp     = kingpin.Flag("timestamps", "Export timestamps of points.").Default("false").Bool()
-	lastPush            = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "influxdb_last_push_timestamp_seconds",
-			Help: "Unix timestamp of the last received influxdb metrics push in seconds.",
-		},
-	)
-	udpParseErrors = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "influxdb_udp_parse_errors_total",
-			Help: "Current total udp parse errors.",
-		},
-	)
-	influxDbRegistry = prometheus.NewRegistry()
 )
 
 type influxDBSample struct {
@@ -72,107 +40,14 @@ type influxDBSample struct {
 	Timestamp time.Time
 }
 
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func (c *influxDBCollector) serveUdp() {
-	buf := make([]byte, MAX_UDP_PAYLOAD)
-	for {
-		n, _, err := c.conn.ReadFromUDP(buf)
-		if err != nil {
-			level.Warn(c.logger).Log("msg", "Failed to read UDP message", "err", err)
-			continue
-		}
-
-		bufCopy := make([]byte, n)
-		copy(bufCopy, buf[:n])
-
-		precision := "ns"
-		points, err := models.ParsePointsWithPrecision(bufCopy, time.Now().UTC(), precision)
-		if err != nil {
-			level.Error(c.logger).Log("msg", "Error parsing udp packet", "err", err)
-			udpParseErrors.Inc()
-			return
-		}
-
-		c.parsePointsToSample(points)
-	}
-}
-
-type influxDBCollector struct {
-	samples map[string]*influxDBSample
-	mu      sync.Mutex
-	ch      chan *influxDBSample
-	logger  log.Logger
-
-	// Udp
-	conn *net.UDPConn
-}
-
-func newInfluxDBCollector(logger log.Logger) *influxDBCollector {
-	c := &influxDBCollector{
-		ch:      make(chan *influxDBSample),
-		samples: map[string]*influxDBSample{},
-		logger:  logger,
-	}
-	go c.processSamples()
-	return c
-}
-
-func (c *influxDBCollector) influxDBPost(w http.ResponseWriter, r *http.Request) {
-
-	lastPush.Set(float64(time.Now().UnixNano()) / 1e9)
-	var buf []byte
-
-	ce := r.Header.Get("Content-Encoding")
-
-	if ce == "gzip" {
-		bufPointer := &buf
-		gunzip, err := gzip.NewReader(r.Body)
-		if err != nil {
-			JSONErrorResponse(w, fmt.Sprintf("error reading compressed body: %s", err), 500)
-			return
-		}
-		*bufPointer, err = ioutil.ReadAll(gunzip)
-		if err != nil {
-			JSONErrorResponse(w, fmt.Sprintf("error decompressing data: %s", err), 500)
-			return
-		}
-	} else {
-		bufPointer := &buf
-		var err error
-		*bufPointer, err = ioutil.ReadAll(r.Body)
-
-		if err != nil {
-			JSONErrorResponse(w, fmt.Sprintf("error reading body: %s", err), 500)
-			return
-		}
-	}
-
-	precision := "ns"
-	if r.FormValue("precision") != "" {
-		precision = r.FormValue("precision")
-	}
-	points, err := models.ParsePointsWithPrecision(buf, time.Now().UTC(), precision)
-	if err != nil {
-		JSONErrorResponse(w, fmt.Sprintf("error parsing request: %s", err), 400)
-		return
-	}
-
-	c.parsePointsToSample(points)
-
-	// InfluxDB returns a 204 on success.
-	http.Error(w, "", http.StatusNoContent)
-}
-
-func (c *influxDBCollector) parsePointsToSample(points []models.Point) {
+func parsePointsToSample(points []models.Point) {
 	for _, s := range points {
 		fields, err := s.Fields()
 		if err != nil {
-			level.Error(c.logger).Log("msg", "error getting fields from point", "err", err)
+			level.Error(logger).Log("msg", "error getting fields from point", "err", err)
 			continue
 		}
+
 		for field, v := range fields {
 			var value float64
 			switch v := v.(type) {
@@ -226,67 +101,33 @@ func (c *influxDBCollector) parsePointsToSample(points []models.Point) {
 			}
 			sample.ID = strings.Join(parts, ".")
 
-			c.ch <- sample
-		}
-	}
-}
-
-func (c *influxDBCollector) processSamples() {
-	ticker := time.NewTicker(time.Minute).C
-	for {
-		select {
-		case s := <-c.ch:
-			c.mu.Lock()
-			c.samples[s.ID] = s
-			c.mu.Unlock()
-
-		case <-ticker:
-			// Garbage collect expired value lists.
-			ageLimit := time.Now().Add(-*sampleExpiry)
-			c.mu.Lock()
-			for k, sample := range c.samples {
-				if ageLimit.After(sample.Timestamp) {
-					delete(c.samples, k)
-				}
+			help := "InfluxDB Metric"
+			mType := clientModel.MetricType_UNTYPED
+			mf := clientModel.MetricFamily{
+				Name:   &sample.Name,            // *string
+				Help:   &help,                   // *string
+				Type:   &mType,                  // *MetricType
+				Metric: []*clientModel.Metric{}, // []*Metric
 			}
-			c.mu.Unlock()
-		}
-	}
-}
 
-// Collect implements prometheus.Collector.
-func (c *influxDBCollector) Collect(ch chan<- prometheus.Metric) {
-	ch <- lastPush
-
-	c.mu.Lock()
-	samples := make([]*influxDBSample, 0, len(c.samples))
-	for _, sample := range c.samples {
-		samples = append(samples, sample)
-	}
-	c.mu.Unlock()
-
-	ageLimit := time.Now().Add(-*sampleExpiry)
-	for _, sample := range samples {
-		if ageLimit.After(sample.Timestamp) {
-			continue
-		}
-
-		metric := prometheus.MustNewConstMetric(
-			prometheus.NewDesc(sample.Name, "InfluxDB Metric", []string{}, sample.Labels),
-			prometheus.UntypedValue,
-			sample.Value,
-		)
-
-		if *exportTimestamp {
+			dtoMetric := clientModel.Metric{}
+			metric := prometheus.MustNewConstMetric(
+				prometheus.NewDesc(sample.Name, "InfluxDB Metric", []string{}, sample.Labels),
+				prometheus.UntypedValue,
+				sample.Value,
+			)
 			metric = prometheus.NewMetricWithTimestamp(sample.Timestamp, metric)
-		}
-		ch <- metric
-	}
-}
+			if err := metric.Write(&dtoMetric); err != nil {
+				handleErr(err)
+			}
+			mf.Metric = append(mf.Metric, &dtoMetric)
 
-// Describe implements prometheus.Collector.
-func (c *influxDBCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- lastPush.Desc()
+			w := io.Writer(os.Stdout)
+			contentType := expfmt.FmtOpenMetrics
+			enc := expfmt.NewEncoder(w, contentType)
+			enc.Encode(&mf)
+		}
+	}
 }
 
 // analog of invalidChars = regexp.MustCompile("[^a-zA-Z0-9_]")
@@ -308,78 +149,34 @@ func ReplaceInvalidChars(in *string) {
 	}
 }
 
-//JSONErrorResponse write error in json fromat and set response code
-func JSONErrorResponse(w http.ResponseWriter, err string, code int) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(errorResponse{
-		Error: err,
-	})
+var logger log.Logger
+
+func handleErr(err error) {
+	fmt.Fprintf(os.Stderr, err.Error())
+	os.Exit(1)
 }
 
 func init() {
-	influxDbRegistry.MustRegister(version.NewCollector("influxdb_exporter"))
-	influxDbRegistry.MustRegister(udpParseErrors)
+	promlogConfig := &promlog.Config{}
+	logger = promlog.New(promlogConfig)
 }
 
 func main() {
-	promlogConfig := &promlog.Config{}
-	flag.AddFlags(kingpin.CommandLine, promlogConfig)
-	kingpin.HelpFlag.Short('h')
-	kingpin.Parse()
-
-	logger := promlog.New(promlogConfig)
-	level.Info(logger).Log("msg", "Starting influxdb_exporter", "version", version.Info())
-	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
-
-	c := newInfluxDBCollector(logger)
-	influxDbRegistry.MustRegister(c)
-
-	addr, err := net.ResolveUDPAddr("udp", *bindAddress)
+	file, err := os.Open(os.Args[1])
 	if err != nil {
-		fmt.Printf("Failed to resolve UDP address %s: %s", *bindAddress, err)
-		os.Exit(1)
+		handleErr(err)
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	buf, err := ioutil.ReadAll(file)
 	if err != nil {
-		fmt.Printf("Failed to set up UDP listener at address %s: %s", addr, err)
-		os.Exit(1)
+		handleErr(err)
 	}
 
-	c.conn = conn
-	go c.serveUdp()
-
-	http.HandleFunc("/write", c.influxDBPost)
-
-	// Some InfluxDB clients try to create a database.
-	http.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"results": []}`)
-	})
-
-	// Some InfluxDB clients want to check if the http server is an influx endpoint
-	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		// InfluxDB returns a 204 on success.
-		http.Error(w, "", http.StatusNoContent)
-	})
-
-	http.Handle(*metricsPath, promhttp.HandlerFor(influxDbRegistry, promhttp.HandlerOpts{}))
-	http.Handle(*exporterMetricsPath, promhttp.Handler())
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-    <head><title>InfluxDB Exporter</title></head>
-    <body>
-    <h1>InfluxDB Exporter</h1>
-    <p><a href="` + *metricsPath + `">Metrics</a></p>
-    <p><a href="` + *exporterMetricsPath + `">Exporter Metrics</a></p>
-    </body>
-    </html>`))
-	})
-
-	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
-		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
-		os.Exit(1)
+	precision := "ns"
+	points, err := models.ParsePointsWithPrecision(buf, time.Now().UTC(), precision)
+	if err != nil {
+		handleErr(err)
 	}
+
+	parsePointsToSample(points)
 }
